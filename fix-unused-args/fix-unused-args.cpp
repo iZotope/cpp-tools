@@ -6,6 +6,7 @@
 #include "clang/Rewrite/Rewriter.h"
 #include "clang/Tooling/Tooling.h"
 #include "llvm/Support/raw_ostream.h"
+#include <string>
 using namespace clang;
 using namespace clang::tooling;
 using namespace llvm;
@@ -84,11 +85,11 @@ private:
   Rewriter TheRewriter;
 };
 
-cl::opt<string> BuildPath(
+cl::opt<std::string> BuildPath(
   "p",
   cl::desc("<build-path>"),
   cl::Optional);
-cl::list<string> SourcePaths(
+cl::list<std::string> SourcePaths(
   cl::Positional,
   cl::desc("<source0> [... <sourceN>]"),
   cl::OneOrMore);
@@ -98,7 +99,7 @@ void LoadCompilationDatabaseIfNotFound(
 
   if (Compilations) return;
 
-  string ErrorMessage;
+  std::string ErrorMessage;
   if (!BuildPath.empty()) {
     Compilations.reset(
         CompilationDatabase::autoDetectFromDirectory(BuildPath,
