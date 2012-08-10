@@ -26,4 +26,6 @@ Usage
     ./fix-unused-args <source0> [... <sourceN>] -- [additional clang args]
 
 This will scan and fix each of the given source files, and overwrite the
-changed files.
+changed files. This tool also supports using a compilation database to figure
+out build options for each file, see
+http://clang.llvm.org/docs/HowToSetupToolingForLLVM.html for more information.
