@@ -16,8 +16,12 @@ using namespace llvm;
 class FixUnusedArgsASTVisitor :
   public RecursiveASTVisitor<FixUnusedArgsASTVisitor> {
 public:
-  FixUnusedArgsASTVisitor(Rewriter &R)
+  FixUnusedArgsASTVisitor(Rewriter &R,
+                          std::string UnusedPrefix,
+                          std::string UnusedSuffix)
     : TheRewriter(R)
+    , UnusedPrefix(std::move(UnusedPrefix))
+    , UnusedSuffix(std::move(UnusedSuffix))
     {}
 
   bool VisitFunctionDecl(FunctionDecl *f) {
@@ -38,20 +42,23 @@ public:
 
 private:
   Rewriter &TheRewriter;
+  const std::string UnusedPrefix, UnusedSuffix;
 
   // Makes a param decl unnamed by commenting the name out.
   void makeParamDeclUnnamed(const ParmVarDecl *Param) {
     SourceLocation NameLoc = Param->getLocation();
-    TheRewriter.InsertTextBefore(NameLoc, "/*");
-    TheRewriter.InsertTextAfterToken(NameLoc, "*/");
+    TheRewriter.InsertTextBefore(NameLoc, UnusedPrefix);
+    TheRewriter.InsertTextAfterToken(NameLoc, UnusedSuffix);
   }
 };
 
 // Runs our AST visitor on top-level declarations.
 class FixUnusedArgsASTConsumer : public ASTConsumer {
 public:
-  FixUnusedArgsASTConsumer(Rewriter &R)
-    : Visitor(R)
+  FixUnusedArgsASTConsumer(Rewriter &R,
+                           std::string UnusedPrefix,
+                           std::string UnusedSuffix)
+    : Visitor(R, std::move(UnusedPrefix), std::move(UnusedSuffix))
   {}
 
   virtual bool HandleTopLevelDecl(DeclGroupRef DR) {
@@ -66,6 +73,24 @@ private:
   FixUnusedArgsASTVisitor Visitor;
 };
 
+cl::opt<std::string> BuildPath(
+  "p",
+  cl::value_desc("build-path"),
+  cl::desc("Build path for the compilation database"),
+  cl::Optional);
+cl::opt<std::string> UnusedPrefix(
+  "unused-prefix",
+  cl::desc("Prefix for removing unused parameters"),
+  cl::init("/*"));
+cl::opt<std::string> UnusedSuffix(
+  "unused-suffix",
+  cl::desc("Suffix for removing unused parameters"),
+  cl::init("*/"));
+cl::list<std::string> SourcePaths(
+  cl::Positional,
+  cl::desc("<source0> [... <sourceN>]"),
+  cl::OneOrMore);
+
 // Frontend action to fix unused arguments and overwrite the changed files.
 class FixUnusedParamAction : public ASTFrontendAction {
 public:
@@ -73,7 +98,9 @@ public:
     clang::CompilerInstance &Compiler, llvm::StringRef InFile) {
     TheRewriter.setSourceMgr(Compiler.getSourceManager(),
                              Compiler.getLangOpts());
-    return new FixUnusedArgsASTConsumer(TheRewriter);
+    return new FixUnusedArgsASTConsumer(TheRewriter,
+                                        UnusedPrefix,
+                                        UnusedSuffix);
   }
 
   // Upon destruction, write all changes to disk.
@@ -84,15 +111,6 @@ public:
 private:
   Rewriter TheRewriter;
 };
-
-cl::opt<std::string> BuildPath(
-  "p",
-  cl::desc("<build-path>"),
-  cl::Optional);
-cl::list<std::string> SourcePaths(
-  cl::Positional,
-  cl::desc("<source0> [... <sourceN>]"),
-  cl::OneOrMore);
 
 void LoadCompilationDatabaseIfNotFound(
     OwningPtr<CompilationDatabase>& Compilations) {
