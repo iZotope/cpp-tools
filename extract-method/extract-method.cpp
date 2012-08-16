@@ -10,6 +10,7 @@
 #include "MethodExtractor.h"
 #include <iostream>
 #include <string>
+#include <vector>
 using namespace clang;
 using namespace clang::tooling;
 using namespace llvm;
@@ -82,10 +83,10 @@ cl::opt<std::string> BuildPath(
   cl::value_desc("build-path"),
   cl::desc("Build path for the compilation database"),
   cl::Optional);
-cl::list<std::string> SourcePaths(
+cl::opt<std::string> SourcePath(
   cl::Positional,
-  cl::desc("<source0> [... <sourceN>]"),
-  cl::OneOrMore);
+  cl::desc("Source file to refactor"),
+  cl::Required);
 cl::opt<unsigned> FirstLine(
   "first",
   cl::desc("The first line of the code to extract"),
@@ -134,7 +135,7 @@ void LoadCompilationDatabaseIfNotFound(
                                                      ErrorMessage));
   } else {
     Compilations.reset(CompilationDatabase::autoDetectFromSource(
-        SourcePaths[0], ErrorMessage));
+        SourcePath, ErrorMessage));
   }
   if (!Compilations) {
     llvm::report_fatal_error(ErrorMessage);
@@ -161,6 +162,8 @@ int main(int argc, char **argv) {
 
   LoadCompilationDatabaseIfNotFound(Compilations);
 
+  std::vector<std::string> SourcePaths;
+  SourcePaths.push_back(std::string(SourcePath));
   ClangTool Tool(*Compilations, SourcePaths);
 
   return Tool.run(newFrontendActionFactory<FixUnusedParamAction>());
