@@ -7,8 +7,10 @@
 #include "MethodExtractor.h"
 #include <cctype>
 #include <iterator>
+#include <map>
 #include <sstream>
 #include <set>
+#include <utility>
 using namespace clang;
 using namespace std;
 
@@ -47,6 +49,7 @@ static SourceRange GetSourceRangeForLines(SourceManager &SM,
   // Advance the end location until the end of the line is hit.
   SourceLocation EndLoc = SM.translateLineCol(FID, LastLine, /*Col*/1);
   EndLoc = AdvanceSourceLocationUntil(EndLoc, SM, IsLineEnding);
+  EndLoc = EndLoc.getLocWithOffset(-1);
   assert(EndLoc.isValid());
 
   assert(SM.isBeforeInTranslationUnit(StartLoc, EndLoc));
@@ -64,7 +67,7 @@ static StringRef GetSourceRangeAsString(const SourceManager &SM,
   assert(!Invalid);
 
   assert(End >= Begin);
-  return StringRef(Begin, End-Begin);
+  return StringRef(Begin, End-Begin+1);
 }
 
 // Replaces the given source range with the code, so that the indentation
@@ -123,7 +126,7 @@ namespace {
       // types, which are both needed.
       Decl *D = DRE->getDecl();
       if (DeclaratorDecl* DD = GetCanonicalDeclaratorDecl(D)) {
-        AddFoundDecl(DD);
+        AddFoundDecl(DD, DRE);
       }
 
       return true;
@@ -134,7 +137,7 @@ namespace {
 
       Decl *D = ME->getMemberDecl();
       if (DeclaratorDecl* DD = GetCanonicalDeclaratorDecl(D)) {
-        AddFoundDecl(DD);
+        AddFoundDecl(DD, ME);
       }
 
       return true;
@@ -158,10 +161,12 @@ namespace {
     };
 
     set<DeclaratorDecl*, order_decl_by_location> FoundDecls;
+    map<DeclaratorDecl*, Expr*> DeclExprMap;
 
     // Only adds D if it's not in our set already.
-    void AddFoundDecl(DeclaratorDecl* D) {
+    void AddFoundDecl(DeclaratorDecl *D, Expr *E) {
       FoundDecls.insert(D);
+      DeclExprMap.insert(make_pair(D, E));
     }
 
 
@@ -184,10 +189,21 @@ namespace {
       return dyn_cast<DeclaratorDecl>(CanDecl);
     }
   public:
+    // Set of all the decls that were found, ordered by declaration order.
     typedef set<DeclaratorDecl*, order_decl_by_location> decl_set;
     typedef decl_set::const_iterator decl_set_iterator;
     decl_set_iterator found_decls_begin() const { return FoundDecls.begin(); }
     decl_set_iterator found_decls_end() const { return FoundDecls.end(); }
+
+    // Map from all found decls to the first usage of it as an expression.
+    typedef map<DeclaratorDecl*, Expr*> decl_expr_map;
+    typedef decl_expr_map::const_iterator decl_expr_map_iterator;
+    decl_expr_map_iterator decl_to_expr_begin() const {
+      return DeclExprMap.begin();
+    }
+    decl_expr_map_iterator decl_to_expr_end() const {
+      return DeclExprMap.end();
+    }
   };
 }
 
@@ -228,13 +244,17 @@ static string BuildFunctionDeclParameterList(DeclIterator BeginDecl,
 
 // Takes a range of decls that should get passed as function arguments,
 // and builds the comma-separated list of arguments.
-template <class DeclIterator>
-static string BuildFunctionCallArgumentList(DeclIterator BeginDecl,
-                                            DeclIterator EndDecl) {
-  DeclIterator LastDecl = prev(EndDecl);
+template <class DeclExprIterator>
+static string BuildFunctionCallArgumentList(DeclExprIterator BeginDecl,
+                                            DeclExprIterator EndDecl,
+                                            const SourceManager &SourceMgr) {
+  DeclExprIterator LastDecl = prev(EndDecl);
   stringstream args;
   for (; BeginDecl != EndDecl; ++BeginDecl) {
-    args << (*BeginDecl)->getNameAsString();
+    Expr *UseExpr = BeginDecl->second;
+    SourceRange UseRange = UseExpr->getSourceRange();
+
+    args << GetSourceRangeAsString(SourceMgr, UseRange).str();
     if (BeginDecl != LastDecl) args << ", ";
   }
   return args.str();
@@ -255,8 +275,9 @@ void MethodExtractor::Run() {
   // Build the new function call, but don't use it yet.
   std::stringstream callstr;
   callstr << NewFunctionName << "("
-          << BuildFunctionCallArgumentList(Finder.found_decls_begin(),
-                                           Finder.found_decls_end())
+          << BuildFunctionCallArgumentList(Finder.decl_to_expr_begin(),
+                                           Finder.decl_to_expr_end(),
+                                           SourceMgr)
           << ");";
 
   // Create the new function with the extracted code as its body.
