@@ -25,11 +25,12 @@ static SourceLocation AdvanceSourceLocationUntil(SourceLocation SL,
     SL = SL.getLocWithOffset(1);
   }
 
+  assert(SL.isValid());
   return SL;
 }
 
 static bool IsNotSpace(char c) { return !std::isspace(c); }
-static bool IsLineEnding(char c) { return c == '\n'; }
+static bool IsLineEnding(char c) { return c == '\n' || c == '\r'; }
 static bool IsNotLineEnding(char c) { return !IsLineEnding(c); }
 
 // Takes two line numbers and a file ID, and returns the corresponding
@@ -38,15 +39,17 @@ static SourceRange GetSourceRangeForLines(SourceManager &SM,
                                           FileID FID,
                                           unsigned FirstLine,
                                           unsigned LastLine) {
-  // Make these zero-based.
-  if (FirstLine > 0) --FirstLine;
-  if (LastLine > 0) --LastLine;
+  assert(FirstLine <= LastLine);
 
-  // Advance the start location past any whitespace.
-  SourceLocation StartLoc = SM.translateLineCol(FID, FirstLine, /*Col*/0);
+  SourceLocation StartLoc = SM.translateLineCol(FID, FirstLine, /*Col*/1);
+  assert(StartLoc.isValid());
 
   // Advance the end location until the end of the line is hit.
-  SourceLocation EndLoc = SM.translateLineCol(FID, LastLine, /*Col*/0);
+  SourceLocation EndLoc = SM.translateLineCol(FID, LastLine, /*Col*/1);
+  EndLoc = AdvanceSourceLocationUntil(EndLoc, SM, IsLineEnding);
+  assert(EndLoc.isValid());
+
+  assert(SM.isBeforeInTranslationUnit(StartLoc, EndLoc));
 
   return SourceRange(StartLoc, EndLoc);
 }
@@ -54,8 +57,13 @@ static SourceRange GetSourceRangeForLines(SourceManager &SM,
 // Returns a string containing all the source code from the given source range.
 static StringRef GetSourceRangeAsString(const SourceManager &SM,
                                         const SourceRange &SR) {
-  const char *Begin = SM.getCharacterData(SR.getBegin());
-  const char *End = SM.getCharacterData(SR.getEnd());
+  bool Invalid = false;
+  const char *Begin = SM.getCharacterData(SR.getBegin(), &Invalid);
+  assert(!Invalid);
+  const char *End = SM.getCharacterData(SR.getEnd(), &Invalid);
+  assert(!Invalid);
+
+  assert(End >= Begin);
   return StringRef(Begin, End-Begin);
 }
 
@@ -109,11 +117,11 @@ namespace {
     bool VisitDeclRefExpr(DeclRefExpr *DRE) {
       if (!IsDeclRefInRange(DRE)) return true;
 
-      // We only thread through value decls. They have names and
+      // We only thread through declarator decls. They have names and
       // types, which are both needed.
-      auto VD = dyn_cast<ValueDecl>(DRE->getDecl()->getCanonicalDecl());
-      if (!VD) return true;
-      AddFoundDecl(VD);
+      auto DD = dyn_cast<DeclaratorDecl>(DRE->getDecl()->getCanonicalDecl());
+      if (!DD) return true;
+      AddFoundDecl(DD);
 
       return true;
     }
@@ -134,10 +142,10 @@ namespace {
       }
     };
 
-    set<ValueDecl*, order_decl_by_location> FoundDecls;
+    set<DeclaratorDecl*, order_decl_by_location> FoundDecls;
 
     // Only adds D if it's not in our set already.
-    void AddFoundDecl(ValueDecl* D) {
+    void AddFoundDecl(DeclaratorDecl* D) {
       FoundDecls.insert(D);
     }
 
@@ -153,24 +161,43 @@ namespace {
       return true;
     }
   public:
-    typedef set<ValueDecl*, order_decl_by_location> decl_set;
+    typedef set<DeclaratorDecl*, order_decl_by_location> decl_set;
     typedef decl_set::const_iterator decl_set_iterator;
     decl_set_iterator found_decls_begin() const { return FoundDecls.begin(); }
     decl_set_iterator found_decls_end() const { return FoundDecls.end(); }
   };
 }
 
+// Makes the type of the given declaration into a reference type if it isn't
+// already one, then returns the resulting type as a string.
+static string PrintAsReferenceType(DeclaratorDecl &DD,
+                                   const SourceManager &SourceMgr) {
+  // Start out with the type.
+  QualType Ty = DD.getType();
+  string BaseStr = Ty.getAsString();
+
+  // If it's not a reference type, make it one.
+  const Type *RawTy = Ty.getTypePtrOrNull();
+  assert(RawTy);
+  if (!RawTy->isReferenceType()) {
+    BaseStr += "&";
+  }
+
+  return BaseStr;
+}
+
 // Takes a range of decls that should turn into a function declaration
 // formal parameter list, and builds that list.
 template <class DeclIterator>
 static string BuildFunctionDeclParameterList(DeclIterator BeginDecl,
-                                             DeclIterator EndDecl) {
+                                             DeclIterator EndDecl,
+                                             const SourceManager &SourceMgr) {
   DeclIterator LastDecl = prev(EndDecl);
   stringstream params;
 
   for (; BeginDecl != EndDecl; ++BeginDecl) {
-    QualType Ty = (*BeginDecl)->getType();
-    params << Ty.getAsString() << "& " << (*BeginDecl)->getNameAsString();
+    params << PrintAsReferenceType(**BeginDecl, SourceMgr) 
+           << " " << (*BeginDecl)->getNameAsString();
     if (BeginDecl != LastDecl) params << ", ";
   }
   return params.str();
@@ -202,26 +229,34 @@ void MethodExtractor::Run() {
   DeclRefFinder Finder(Range, SourceMgr);
   Finder.TraverseDecl(&FnDecl);
 
-  // Replace the code to extract with a call to the new function.
+  // Build the new function call, but don't use it yet.
   std::stringstream callstr;
   callstr << NewFunctionName << "("
           << BuildFunctionCallArgumentList(Finder.found_decls_begin(),
                                            Finder.found_decls_end())
           << ");\n";
-  ReplaceSourceRangeWithCode(Range, callstr.str(), SourceMgr, TheRewriter);
 
   // Create the new function with the extracted code as its body.
+  // Again, don't use it yet.
   SourceRange SkipLeadingNewline(
       AdvanceSourceLocationUntil(Range.getBegin(),
                                  SourceMgr,
                                  IsNotLineEnding),
       Range.getEnd());
-  InsertNewFunctionWithBody(
-      FnDecl,
-      NewFunctionName,
+  const string NewFunctionParamList = 
       BuildFunctionDeclParameterList(Finder.found_decls_begin(),
-                                     Finder.found_decls_end()),
-      GetSourceRangeAsString(SourceMgr, SkipLeadingNewline).str(),
-      TheRewriter);
+                                     Finder.found_decls_end(),
+                                     SourceMgr);
+  const string NewFunctionBody =
+      GetSourceRangeAsString(SourceMgr, SkipLeadingNewline).str();                                     
+  // Finally, perform all the replacements. It's important to do them at
+  // the end so that we don't try to build code by reading existing source
+  // code that has been moved around as a result of rewriting.
+  ReplaceSourceRangeWithCode(Range, callstr.str(), SourceMgr, TheRewriter);
+  InsertNewFunctionWithBody(FnDecl,
+                            NewFunctionName,
+                            NewFunctionParamList,
+                            NewFunctionBody,
+                            TheRewriter);
 }
 

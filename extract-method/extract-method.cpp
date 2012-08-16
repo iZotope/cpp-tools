@@ -141,6 +141,13 @@ void LoadCompilationDatabaseIfNotFound(
   }
 }
 
+void ValidateCommandLineOptions() {
+  if (FirstLine > LastLine) {
+    llvm::report_fatal_error(
+        "The beginning line number must come before the end line number");
+  }
+}
+
 int main(int argc, char **argv) {
   // Try to create a fixed compile command database.
   OwningPtr<CompilationDatabase> Compilations(
@@ -150,6 +157,7 @@ int main(int argc, char **argv) {
   // Next, use normal llvm command line parsing to get the tool specific
   // parameters.
   cl::ParseCommandLineOptions(argc, argv);
+  ValidateCommandLineOptions();
 
   LoadCompilationDatabaseIfNotFound(Compilations);
 
