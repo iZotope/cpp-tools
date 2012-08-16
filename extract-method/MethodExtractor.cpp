@@ -73,13 +73,15 @@ static void ReplaceSourceRangeWithCode(const SourceRange &Range,
                                        const string& NewCode,
                                        const SourceManager &SourceMgr,
                                        Rewriter &TheRewriter) {
+  // The range should skip all leading whitespace, and extend all the
+  // way until the end of the line.
   SourceRange SkipLeadingWhitespace(
       AdvanceSourceLocationUntil(Range.getBegin(),
                                  SourceMgr,
                                  IsNotSpace),
       AdvanceSourceLocationUntil(Range.getEnd(),
                                  SourceMgr,
-                                 IsNotLineEnding));
+                                 IsLineEnding));
   TheRewriter.ReplaceText(SkipLeadingWhitespace, NewCode);
 }
 
@@ -115,16 +117,29 @@ namespace {
     {}
 
     bool VisitDeclRefExpr(DeclRefExpr *DRE) {
-      if (!IsDeclRefInRange(DRE)) return true;
+      if (!IsExprInRange(DRE)) return true;
 
       // We only thread through declarator decls. They have names and
       // types, which are both needed.
-      auto DD = dyn_cast<DeclaratorDecl>(DRE->getDecl()->getCanonicalDecl());
-      if (!DD) return true;
-      AddFoundDecl(DD);
+      Decl *D = DRE->getDecl();
+      if (DeclaratorDecl* DD = GetCanonicalDeclaratorDecl(D)) {
+        AddFoundDecl(DD);
+      }
 
       return true;
     }
+
+    bool VisitMemberExpr(MemberExpr *ME) {
+      if (!IsExprInRange(ME)) return true;
+
+      Decl *D = ME->getMemberDecl();
+      if (DeclaratorDecl* DD = GetCanonicalDeclaratorDecl(D)) {
+        AddFoundDecl(DD);
+      }
+
+      return true;
+    }
+
   private:
     const SourceRange Range;
     const SourceManager &SourceMgr;
@@ -149,8 +164,9 @@ namespace {
       FoundDecls.insert(D);
     }
 
-    bool IsDeclRefInRange(DeclRefExpr *DRE) const {
-      SourceLocation Loc = DRE->getLocation();
+
+    bool IsExprInRange(Expr *E) const {
+      SourceLocation Loc = E->getLocStart();
       if (SourceMgr.getFileID(Loc) != FID) return false;
       if (SourceMgr.isBeforeInTranslationUnit(Loc, Range.getBegin())) {
         return false;
@@ -159,6 +175,13 @@ namespace {
         return false;
       }
       return true;
+    }
+
+    // If the canonical decl is a declarator decl, returns that.
+    // Otherwise returns NULL.
+    DeclaratorDecl* GetCanonicalDeclaratorDecl(Decl *D) {
+      Decl *CanDecl = D->getCanonicalDecl();
+      return dyn_cast<DeclaratorDecl>(CanDecl);
     }
   public:
     typedef set<DeclaratorDecl*, order_decl_by_location> decl_set;
@@ -234,7 +257,7 @@ void MethodExtractor::Run() {
   callstr << NewFunctionName << "("
           << BuildFunctionCallArgumentList(Finder.found_decls_begin(),
                                            Finder.found_decls_end())
-          << ");\n";
+          << ");";
 
   // Create the new function with the extracted code as its body.
   // Again, don't use it yet.
