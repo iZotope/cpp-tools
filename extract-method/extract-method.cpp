@@ -144,7 +144,7 @@ void LoadCompilationDatabaseIfNotFound(
 void ValidateCommandLineOptions() {
   if (FirstLine > LastLine) {
     llvm::report_fatal_error(
-        "The beginning line number must come before the end line number");
+        "The beginning line number must come before the end line number.");
   }
 }
 

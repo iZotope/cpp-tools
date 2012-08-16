@@ -162,11 +162,23 @@ namespace {
 
     set<DeclaratorDecl*, order_decl_by_location> FoundDecls;
     map<DeclaratorDecl*, Expr*> DeclExprMap;
+    map<Expr*, DeclaratorDecl*> UsesToDeclMap;
 
-    // Only adds D if it's not in our set already.
+    // When we encounter a use of a decl, this updates our data structures.
     void AddFoundDecl(DeclaratorDecl *D, Expr *E) {
-      FoundDecls.insert(D);
-      DeclExprMap.insert(make_pair(D, E));
+      auto lb = FoundDecls.lower_bound(D);
+
+      // Only update the two containers that are keyed on the decl if
+      // this is a completely new decl. This preserves the invariant that
+      // we store the first use of a decl.
+      if (lb == FoundDecls.end() || FoundDecls.key_comp()(D, *lb)) {
+        FoundDecls.insert(lb, D);
+        DeclExprMap.insert(make_pair(D, E));
+      }
+
+      // Always update the map of uses, whether this is the first time we've
+      // seen this decl, or not.
+      UsesToDeclMap.insert(make_pair(E, D));
     }
 
 
@@ -194,6 +206,7 @@ namespace {
     typedef decl_set::const_iterator decl_set_iterator;
     decl_set_iterator found_decls_begin() const { return FoundDecls.begin(); }
     decl_set_iterator found_decls_end() const { return FoundDecls.end(); }
+    const decl_set& found_decls() const { return FoundDecls; }
 
     // Map from all found decls to the first usage of it as an expression.
     typedef map<DeclaratorDecl*, Expr*> decl_expr_map;
@@ -204,6 +217,20 @@ namespace {
     decl_expr_map_iterator decl_to_expr_end() const {
       return DeclExprMap.end();
     }
+    const decl_expr_map decl_to_expr() const { return DeclExprMap; }
+
+    // Map from all uses of found decls back to the decl. This is useful
+    // for rewriting all uses in the code.
+    typedef map<Expr*, DeclaratorDecl*> uses_to_decl_map;
+    typedef uses_to_decl_map::const_iterator uses_to_decl_map_iterator;
+    uses_to_decl_map_iterator uses_to_decl_begin() const {
+      return UsesToDeclMap.begin();
+    }
+    uses_to_decl_map_iterator uses_to_decl_end() const {
+      return UsesToDeclMap.end();
+    }
+    const uses_to_decl_map& uses_to_decl() const { return UsesToDeclMap; }
+
   };
 }
 
@@ -227,16 +254,17 @@ static string PrintAsReferenceType(DeclaratorDecl &DD,
 
 // Takes a range of decls that should turn into a function declaration
 // formal parameter list, and builds that list.
-template <class DeclIterator>
-static string BuildFunctionDeclParameterList(DeclIterator BeginDecl,
-                                             DeclIterator EndDecl,
+template <class DeclNameIterator>
+static string BuildFunctionDeclParameterList(DeclNameIterator BeginDecl,
+                                             DeclNameIterator EndDecl,
                                              const SourceManager &SourceMgr) {
-  DeclIterator LastDecl = prev(EndDecl);
+  DeclNameIterator LastDecl = prev(EndDecl);
   stringstream params;
 
   for (; BeginDecl != EndDecl; ++BeginDecl) {
-    params << PrintAsReferenceType(**BeginDecl, SourceMgr) 
-           << " " << (*BeginDecl)->getNameAsString();
+
+    params << PrintAsReferenceType(*BeginDecl->first, SourceMgr) 
+           << " " << BeginDecl->second;
     if (BeginDecl != LastDecl) params << ", ";
   }
   return params.str();
@@ -260,6 +288,96 @@ static string BuildFunctionCallArgumentList(DeclExprIterator BeginDecl,
   return args.str();
 }
 
+// Maps a range of decls to a list of unique strings that could be function
+// arguments. If the decls all have unique names, we'll just use the
+// identifiers. However, member expressions like 'this->n' get turned into
+// just 'n'. Then if there's redundancy, i.e. if there was also a non-member
+// variable called 'n', the names have to get uniqued.
+template <class DeclExprIterator>
+static map<DeclaratorDecl*, std::string>
+MapDeclsToParamNames(DeclExprIterator BeginDecl,
+                     DeclExprIterator EndDecl) {
+  typedef DeclaratorDecl* DeclPtr;
+  map<DeclPtr, std::string> DeclNames;
+  map<std::string, DeclPtr> NamesToDecl;
+
+  // First go through and add all the non-member decls. The member decls
+  // need to be added last, so that if there are conflicting names, the
+  // member ones get renamed;
+  for (auto CurDecl = BeginDecl; CurDecl != EndDecl; ++CurDecl) {
+    if ((*CurDecl)->isCXXClassMember()) continue;
+
+    // First try to use the decl's name.
+    std::string Name = (*CurDecl)->getNameAsString();
+
+    // If a decl by this name already exists, keep appending
+    // underscores until it doesn't.
+    auto lb = NamesToDecl.lower_bound(Name);
+    while (lb != NamesToDecl.end()
+           && !(NamesToDecl.key_comp()(Name, lb->first))) {
+      Name += "_";
+      lb = NamesToDecl.lower_bound(Name);
+    }
+
+    // Now the name is unique.
+    assert(NamesToDecl.find(Name) == NamesToDecl.end());
+    NamesToDecl.insert(lb, make_pair(Name, *CurDecl));
+    DeclNames.insert(make_pair(*CurDecl, Name));
+  }
+
+  // Now add the member decls.
+  for (auto CurDecl = BeginDecl; CurDecl != EndDecl; ++CurDecl) {
+    if (!(*CurDecl)->isCXXClassMember()) continue;
+
+    // First try to use the decl's name.
+    std::string Name = (*CurDecl)->getNameAsString();
+    
+    // If a decl by this name already exists, first try adding "this_"
+    // as a prefix, since we added non-member variables first. If that
+    // doesn't work, roll back to the original name.
+    auto lb = NamesToDecl.lower_bound(Name);
+    if (lb != NamesToDecl.end()
+        && !(NamesToDecl.key_comp()(Name, lb->first))) {
+      std::string NewName = "this_" + Name;
+      auto new_lb = NamesToDecl.lower_bound(NewName);
+      if (new_lb == NamesToDecl.end()
+          || NamesToDecl.key_comp()(NewName, lb->first)) {
+        Name = NewName;
+        lb = new_lb;
+      }
+    }
+
+    // If a decl by this name already exists, keep appending
+    // underscores until it doesn't.
+    while (lb != NamesToDecl.end()
+           && !(NamesToDecl.key_comp()(Name, lb->first))) {
+      Name += "_";
+      lb = NamesToDecl.lower_bound(Name);
+    }
+
+    // Now the name is unique.
+    assert(NamesToDecl.find(Name) == NamesToDecl.end());
+    NamesToDecl.insert(lb, make_pair(Name, *CurDecl));
+    DeclNames.insert(make_pair(*CurDecl, Name));
+  }
+
+  return DeclNames;
+}
+
+// Rewrites all expressions using the given decls with their new names.
+void RewriteDeclUses(const map<Expr*, DeclaratorDecl*>& UsesMap,
+                     const map<DeclaratorDecl*, std::string>& NamesMap,
+                     Rewriter &R) {
+
+  for (auto CurUse = UsesMap.begin(), EndUse = UsesMap.end();
+       CurUse != EndUse; ++CurUse) {
+
+    auto NewNameEntry = NamesMap.find(CurUse->second);
+    assert(NewNameEntry != NamesMap.end());
+    R.ReplaceText(CurUse->first->getSourceRange(), NewNameEntry->second);
+  }
+}
+
 void MethodExtractor::Run() {
   FileID FID = SourceMgr.getFileID(FnDecl.getSourceRange().getBegin());
   SourceRange Range = GetSourceRangeForLines(SourceMgr,
@@ -280,6 +398,10 @@ void MethodExtractor::Run() {
                                            SourceMgr)
           << ");";
 
+  // Each decl that we thread through needs to have a unique parameter name.
+  auto DeclNames = MapDeclsToParamNames(Finder.found_decls_begin(),
+                                        Finder.found_decls_end());
+
   // Create the new function with the extracted code as its body.
   // Again, don't use it yet.
   SourceRange SkipLeadingNewline(
@@ -288,14 +410,20 @@ void MethodExtractor::Run() {
                                  IsNotLineEnding),
       Range.getEnd());
   const string NewFunctionParamList = 
-      BuildFunctionDeclParameterList(Finder.found_decls_begin(),
-                                     Finder.found_decls_end(),
+      BuildFunctionDeclParameterList(DeclNames.begin(),
+                                     DeclNames.end(),
                                      SourceMgr);
+
+  // Rewrite all uses of the decls that we're threading through, as
+  // necessary. That rewritten code will get used for the newly created
+  // function's body.
+  RewriteDeclUses(Finder.uses_to_decl(),
+                  DeclNames,
+                  TheRewriter);
   const string NewFunctionBody =
-      GetSourceRangeAsString(SourceMgr, SkipLeadingNewline).str();                                     
-  // Finally, perform all the replacements. It's important to do them at
-  // the end so that we don't try to build code by reading existing source
-  // code that has been moved around as a result of rewriting.
+      TheRewriter.getRewrittenText(SkipLeadingNewline);
+
+  // Finally, perform all the replacements.
   ReplaceSourceRangeWithCode(Range, callstr.str(), SourceMgr, TheRewriter);
   InsertNewFunctionWithBody(FnDecl,
                             NewFunctionName,
